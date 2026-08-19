@@ -1,0 +1,4 @@
+/target
+# --print-id / smoke scratch dirs
+selftest-data/
+smoke-data/

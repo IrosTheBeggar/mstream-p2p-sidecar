@@ -1,0 +1,269 @@
+# Builds the glibc / darwin / windows binaries on a v* tag push and attaches
+# them to a DRAFT release for that tag, together with a machine-readable
+# manifest fragment (file/sha256/size per binary). A maintainer publishes
+# the draft — CI never publishes.
+#
+# The musl set (Alpine / linuxserver.io Docker) lives in release-musl.yml —
+# it uploads to the SAME draft release but owns its own fragment file, so
+# the two publishers never write the same asset.
+#
+# Invariants the publish job enforces:
+#   - a family's asset set is uploaded binaries-first, fragment-LAST: the
+#     fragment on the release is the family's completion marker, so a
+#     manifest assembled from fragments can never reference a half-uploaded
+#     set;
+#   - a PUBLISHED release is immutable: re-runs refuse to touch one (fix
+#     forward with a new tag instead);
+#   - while the release is a draft and the family's fragment is absent,
+#     re-runs replace any partial leftovers (--clobber) — artifact-expiry
+#     re-runs are safe.
+#
+# mStream consumes published releases through its committed
+# bin/p2p-sidecar/manifest*.json, which pin {repo, tag, file, sha256, size};
+# its server verifies every downloaded byte against those pins.
+name: Release (glibc, darwin, windows)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build + self-test only; do not touch the release (useful when dispatched on a tag ref)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.binary_name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # self_test: run the freshly built binary before shipping it —
+        # enabled wherever the binary can execute on its build host. The
+        # cross-built ARM Linux binaries can't run on the x64 host (the musl
+        # workflow's static binaries can, under qemu — see there).
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            binary_name: p2p-sidecar-win32-x64.exe
+            use_cross: false
+            self_test: true
+
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            binary_name: p2p-sidecar-darwin-x64
+            use_cross: false
+            self_test: true
+
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            binary_name: p2p-sidecar-darwin-arm64
+            use_cross: false
+            self_test: true
+
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            binary_name: p2p-sidecar-linux-x64
+            use_cross: false
+            self_test: true
+
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            binary_name: p2p-sidecar-linux-arm64
+            use_cross: true
+
+          - target: armv7-unknown-linux-gnueabihf
+            runner: ubuntu-latest
+            binary_name: p2p-sidecar-linux-arm
+            use_cross: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: |
+          # Pinned + hashed: `releases/latest` piped straight into
+          # ~/.cargo/bin would mean a new (or hijacked) cross release runs on
+          # the next tag and produces the shipped ARM binaries. Bump the
+          # version and the sha256 together (sha256sum of the release asset).
+          curl -fsSL -o cross.tar.gz "https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz"
+          echo "642375d1bcf3bd88272c32ba90e999f3d983050adf45e66bd2d3887e8e838bad  cross.tar.gz" | sha256sum -c -
+          tar xzf cross.tar.gz -C "$HOME/.cargo/bin" && rm cross.tar.gz
+
+      # The wire-verification unit tests (forged signatures, impersonation,
+      # tampered holds) run on the native legs — pure logic needs one
+      # platform, and the cross legs can't execute their test binaries.
+      - name: Unit tests
+        if: matrix.self_test
+        run: cargo test --locked
+        shell: bash
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.use_cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+        shell: bash
+
+      - name: Stage binary
+        run: |
+          src="target/${{ matrix.target }}/release/p2p-sidecar"
+          if [[ "${{ matrix.binary_name }}" == *.exe ]]; then
+            src="${src}.exe"
+          fi
+          mkdir -p staging
+          cp "$src" "staging/${{ matrix.binary_name }}"
+        shell: bash
+
+      # --print-id is the one-shot CI mode: create an identity, print the
+      # derived endpoint id (64 hex chars), exit — no sockets, no network.
+      # Proves the executable launches and its crypto stack works.
+      - name: Self-test the freshly built binary
+        if: matrix.self_test
+        shell: bash
+        run: |
+          bin="staging/${{ matrix.binary_name }}"
+          echo "self-testing: $bin"
+          out="$("$bin" --print-id --data-dir selftest-data)"
+          echo "  --print-id: $out"
+          echo "$out" | grep -Eq '^[0-9a-f]{64}$' \
+            || { echo "::error::self-test: --print-id produced no/invalid output"; exit 1; }
+          out2="$("$bin" --print-id --data-dir selftest-data)"
+          [ "$out" = "$out2" ] \
+            || { echo "::error::self-test: identity did not persist between runs"; exit 1; }
+          echo "self-test passed: ${{ matrix.binary_name }}"
+
+      # Real-run smoke (Linux only — needs GNU timeout): --print-id never
+      # opens a socket, so it misses runtime breakage in the QUIC/UDP layer —
+      # noq-udp 1.1.0's musl cmsg-alignment assert (2026-07) passed the
+      # identity checks and SIGABRTed at endpoint bind in production. With
+      # stdin at EOF the sidecar emits 'ready' (right after the endpoint
+      # binds — no relay round-trip) and exits cleanly on its own.
+      - name: Real-run smoke
+        if: matrix.self_test && runner.os == 'Linux'
+        shell: bash
+        run: |
+          bin="staging/${{ matrix.binary_name }}"
+          set +e
+          real_out="$(timeout 30 "$bin" --data-dir smoke-data </dev/null 2>&1)"
+          real_code=$?
+          set -e
+          echo "  real-run exit=$real_code"
+          echo "$real_out" | head -3
+          echo "$real_out" | grep -q '"event":"ready"' \
+            || { echo "::error::real-run smoke: no ready event before exit"; exit 1; }
+          [ "$real_code" -eq 0 ] \
+            || { echo "::error::real-run smoke: sidecar exited $real_code (expected clean EOF shutdown)"; exit 1; }
+          echo "real-run smoke passed: ${{ matrix.binary_name }}"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.binary_name }}
+          path: staging/${{ matrix.binary_name }}
+          # 7, not 1: the publish job refuses a partial set, and a next-week
+          # "re-run failed jobs" must still find its sibling artifacts.
+          retention-days: 7
+
+  publish:
+    name: Attach assets to the draft release
+    needs: build
+    # Tag pushes, and dispatches aimed at a tag ref without dry_run. A
+    # dispatch on a branch ref builds + self-tests only.
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: staging
+          merge-multiple: true
+
+      - name: Upload assets + fragment to the draft release
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          fragment_name="manifest-fragment.json"
+          names="p2p-sidecar-win32-x64.exe p2p-sidecar-darwin-x64 p2p-sidecar-darwin-arm64 p2p-sidecar-linux-x64 p2p-sidecar-linux-arm64 p2p-sidecar-linux-arm"
+
+          # 1. Inventory: every leg, non-empty. Anything less is not a set
+          #    this tag built — refuse rather than ship it.
+          missing=""
+          for name in $names; do
+            [ -s "staging/$name" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::not all binaries were built by this run (missing:$missing) — an artifact expired or a leg was skipped; re-run ALL jobs, never 'failed jobs only'"
+            exit 1
+          fi
+
+          # 2. Fragment (uploaded LAST below — it is the completion marker).
+          node scripts/make-fragment.mjs \
+            --tag "$TAG" --built-from "$GITHUB_SHA" --run-url "$RUN_URL" \
+            --staging staging --out "$fragment_name" \
+            $names
+
+          # 3. Release state. Create the draft if missing (`|| true`: the
+          #    musl workflow may have just created it; the re-view is the
+          #    real gate). A PUBLISHED release is immutable: complete
+          #    (fragment present) means nothing to do; incomplete means a
+          #    human published a half-uploaded draft — refuse loudly.
+          if ! gh release view "$TAG" --json tagName --jq .tagName >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag \
+              --title "$TAG" \
+              --notes "Prebuilt p2p-sidecar binaries for mStream. Verify downloads against manifest-fragment*.json (sha256 per file); mStream's committed bin/p2p-sidecar manifests pin the same hashes. Published assets are immutable — fixes ship as a new version." \
+              || true
+            gh release view "$TAG" --json tagName --jq .tagName >/dev/null
+          fi
+          is_draft="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
+          assets="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          if printf '%s\n' "$assets" | grep -qxF "$fragment_name"; then
+            if [ "$is_draft" = "true" ]; then
+              echo "fragment already on the draft — this family's set is complete; nothing to do"
+            else
+              echo "release already published with a complete $fragment_name — immutable; nothing to do"
+            fi
+            exit 0
+          fi
+          if [ "$is_draft" != "true" ]; then
+            echo "::error::release $TAG is published but has no $fragment_name — it was published from an incomplete draft; cut a new tag instead of mutating it"
+            exit 1
+          fi
+
+          # 4. Binaries first (replacing any partial leftovers from an
+          #    earlier failed run — safe: still a draft, fragment absent),
+          #    fragment last.
+          for name in $names; do
+            gh release upload "$TAG" "staging/$name" --clobber
+            echo "uploaded: $name"
+          done
+          gh release upload "$TAG" "$fragment_name" --clobber
+          echo "uploaded: $fragment_name (family complete)"
+          echo "draft release $TAG ready for review — publishing is a human action"

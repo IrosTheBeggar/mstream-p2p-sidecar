@@ -1,0 +1,193 @@
+# Builds the statically-linked musl binaries (Alpine Linux and other
+# musl-libc distros — most importantly the linuxserver.io Docker image) on a
+# v* tag push and attaches them to the SAME draft release as release.yml,
+# under its own fragment file (manifest-fragment-musl.json) so the two
+# publishers never write the same asset. See release.yml's header for the
+# invariants (draft-only mutation, fragment-last completion marker,
+# published releases immutable).
+#
+# cross-rs for every leg, every leg self-tested (x64 natively, ARM under
+# qemu-user — static binaries need no sysroot). The crypto stack is
+# ring-only, which cross's musl images build without extra toolchain work.
+name: Release (musl)
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build + self-test only; do not touch the release (useful when dispatched on a tag ref)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-musl-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.binary_name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            binary_name: p2p-sidecar-linux-x64-musl
+
+          - target: aarch64-unknown-linux-musl
+            binary_name: p2p-sidecar-linux-arm64-musl
+            emulate: true
+
+          - target: armv7-unknown-linux-musleabihf
+            binary_name: p2p-sidecar-linux-arm-musl
+            emulate: true
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        run: |
+          # Pinned + hashed — see release.yml. Bump version and sha256 together.
+          curl -fsSL -o cross.tar.gz "https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz"
+          echo "642375d1bcf3bd88272c32ba90e999f3d983050adf45e66bd2d3887e8e838bad  cross.tar.gz" | sha256sum -c -
+          tar xzf cross.tar.gz -C "$HOME/.cargo/bin" && rm cross.tar.gz
+
+      - name: Build
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage binary
+        run: |
+          mkdir -p staging
+          cp "target/${{ matrix.target }}/release/p2p-sidecar" "staging/${{ matrix.binary_name }}"
+          chmod +x "staging/${{ matrix.binary_name }}"
+
+      # Register binfmt handlers so the x64 host can transparently execute
+      # the foreign-arch static musl binaries via qemu-user.
+      - name: Set up QEMU
+        if: matrix.emulate
+        uses: docker/setup-qemu-action@v3
+
+      # Identity self-test + real-run smoke on EVERY musl leg (static
+      # binaries run under qemu with no sysroot). The real-run matters:
+      # --print-id never opens a socket, and noq-udp 1.1.0's musl
+      # cmsg-alignment assert (2026-07, SIGABRT at endpoint bind on the
+      # Alpine Docker image) sailed straight through the identity checks.
+      - name: Self-test the freshly built binary
+        shell: bash
+        run: |
+          bin="staging/${{ matrix.binary_name }}"
+          echo "self-testing: $bin"
+          out="$("$bin" --print-id --data-dir selftest-data)"
+          echo "  --print-id: $out"
+          echo "$out" | grep -Eq '^[0-9a-f]{64}$' \
+            || { echo "::error::self-test: --print-id produced no/invalid output"; exit 1; }
+          out2="$("$bin" --print-id --data-dir selftest-data)"
+          [ "$out" = "$out2" ] \
+            || { echo "::error::self-test: identity did not persist between runs"; exit 1; }
+          set +e
+          real_out="$(timeout 30 "$bin" --data-dir smoke-data </dev/null 2>&1)"
+          real_code=$?
+          set -e
+          echo "  real-run exit=$real_code"
+          echo "$real_out" | head -3
+          echo "$real_out" | grep -q '"event":"ready"' \
+            || { echo "::error::real-run smoke: no ready event before exit"; exit 1; }
+          [ "$real_code" -eq 0 ] \
+            || { echo "::error::real-run smoke: sidecar exited $real_code (expected clean EOF shutdown)"; exit 1; }
+          echo "self-test passed: ${{ matrix.binary_name }}"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.binary_name }}
+          path: staging/${{ matrix.binary_name }}
+          # 7, not 1: the publish job refuses a partial set (see there).
+          retention-days: 7
+
+  publish:
+    name: Attach assets to the draft release
+    needs: build
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all binaries
+        uses: actions/download-artifact@v8
+        with:
+          path: staging
+          merge-multiple: true
+
+      - name: Upload assets + fragment to the draft release
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          fragment_name="manifest-fragment-musl.json"
+          names="p2p-sidecar-linux-x64-musl p2p-sidecar-linux-arm64-musl p2p-sidecar-linux-arm-musl"
+
+          # 1. Inventory: the full musl set, non-empty.
+          missing=""
+          for name in $names; do
+            [ -s "staging/$name" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::not all musl binaries were built by this run (missing:$missing) — an artifact expired or a leg was skipped; re-run ALL jobs, never 'failed jobs only'"
+            exit 1
+          fi
+
+          # 2. Fragment (uploaded LAST below — the completion marker).
+          node scripts/make-fragment.mjs \
+            --tag "$TAG" --built-from "$GITHUB_SHA" --run-url "$RUN_URL" \
+            --staging staging --out "$fragment_name" \
+            $names
+
+          # 3. Release state — see release.yml for the full rationale.
+          if ! gh release view "$TAG" --json tagName --jq .tagName >/dev/null 2>&1; then
+            gh release create "$TAG" --draft --verify-tag \
+              --title "$TAG" \
+              --notes "Prebuilt p2p-sidecar binaries for mStream. Verify downloads against manifest-fragment*.json (sha256 per file); mStream's committed bin/p2p-sidecar manifests pin the same hashes. Published assets are immutable — fixes ship as a new version." \
+              || true
+            gh release view "$TAG" --json tagName --jq .tagName >/dev/null
+          fi
+          is_draft="$(gh release view "$TAG" --json isDraft --jq .isDraft)"
+          assets="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          if printf '%s\n' "$assets" | grep -qxF "$fragment_name"; then
+            if [ "$is_draft" = "true" ]; then
+              echo "fragment already on the draft — this family's set is complete; nothing to do"
+            else
+              echo "release already published with a complete $fragment_name — immutable; nothing to do"
+            fi
+            exit 0
+          fi
+          if [ "$is_draft" != "true" ]; then
+            echo "::error::release $TAG is published but has no $fragment_name — it was published from an incomplete draft; cut a new tag instead of mutating it"
+            exit 1
+          fi
+
+          # 4. Binaries first (replace partial leftovers — still a draft,
+          #    fragment absent), fragment last.
+          for name in $names; do
+            gh release upload "$TAG" "staging/$name" --clobber
+            echo "uploaded: $name"
+          done
+          gh release upload "$TAG" "$fragment_name" --clobber
+          echo "uploaded: $fragment_name (family complete)"
+          echo "draft release $TAG ready for review — publishing is a human action"

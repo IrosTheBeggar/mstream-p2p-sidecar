@@ -1,0 +1,46 @@
+# PR / main-branch gate: the crate must build and its tests must pass on the
+# one platform that can exercise everything cheaply. The full nine-target
+# build + release flow lives in release.yml / release-musl.yml and runs on
+# v* tags.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Unit tests (wire verification: forged signatures, impersonation,
+      # tampered holds) + the stdin-EOF integration test.
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      # --print-id: create an identity, print the endpoint id, exit — no
+      # sockets. Twice, to prove the identity persists.
+      - name: Self-test
+        run: |
+          bin=target/release/p2p-sidecar
+          out="$("$bin" --print-id --data-dir selftest-data)"
+          echo "--print-id: $out"
+          echo "$out" | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::invalid --print-id output"; exit 1; }
+          out2="$("$bin" --print-id --data-dir selftest-data)"
+          [ "$out" = "$out2" ] || { echo "::error::identity did not persist"; exit 1; }
