@@ -1,6 +1,6 @@
 [package]
 name = "p2p-sidecar"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 
 [[bin]]
@@ -17,7 +17,18 @@ path = "src/main.rs"
 # together, deliberately, and re-run the integration tests when you do.
 iroh = "=1.0.3"
 iroh-blobs = "=0.103.0"
-iroh-gossip = "=0.101.0"
+# iroh-gossip comes from the mStream FORK, not crates.io: the tag is
+# upstream v0.101.0 (the newest release, still the exact set validated by
+# the 2026-07 spike) plus upstream PR #154, which is open but unmerged —
+# without it, every superseded or dropped peer link between two live
+# processes leaks a kept-alive QUIC connection (~110 KB each, about one
+# per hyparview shuffle interval per node), which is what OOM-killed
+# long-running sidecars on a ~102-hour fuse (mStream #880/#881, and the
+# fork's own commit message for the full record). Retire the fork and
+# re-pin "=0.101.x" from crates.io the moment an upstream release contains
+# the fix; treat the tag like the exact pins around it — never track a
+# branch.
+iroh-gossip = { git = "https://github.com/IrosTheBeggar/iroh-gossip", tag = "v0.101.0-leakfix.1" }
 iroh-tickets = "=1.0.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

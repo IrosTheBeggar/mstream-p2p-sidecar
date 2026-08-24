@@ -1651,8 +1651,7 @@ dependencies = [
 [[package]]
 name = "iroh-gossip"
 version = "0.101.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e1dc4b05f73e7a1b9e83b531eb63c3fd671b0af3aeb13b59c546dd7ca747515"
+source = "git+https://github.com/IrosTheBeggar/iroh-gossip?tag=v0.101.0-leakfix.1#b8d35bb62b8960bcb233232745a7bc37ea4f337a"
 dependencies = [
  "blake3",
  "bytes",
@@ -2486,7 +2485,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
 name = "p2p-sidecar"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "anyhow",
  "iroh",

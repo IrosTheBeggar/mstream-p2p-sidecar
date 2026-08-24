@@ -100,6 +100,15 @@ const HOLDS_INTERVAL: Duration = Duration::from_secs(60);
 const HOLDS_SIGNING_CONTEXT: &str = "mstream-discovery-holds-v1";
 const MAX_HOLDS: usize = 64;
 const MAX_HOLDS_BYTES: usize = 8192;
+// Flood-guard hygiene (the last_accepted map): entries for origins gone
+// quiet are dropped after a TTL, and the map is hard-capped — a hostile
+// peer minting fresh identities (each valid signed announcement inserts a
+// key) must not grow it without bound. Eviction is safe because this map
+// is a RATE-LIMIT cache only: replay/rollback protection lives on the
+// Node side, where discovery-catalog keeps the highest snapshotSeq per
+// origin regardless of what slips through here.
+const LAST_ACCEPTED_TTL: Duration = Duration::from_secs(30 * 60);
+const LAST_ACCEPTED_CAP: usize = 4096;
 
 #[derive(Deserialize, Debug)]
 struct Request {
@@ -769,6 +778,7 @@ async fn process_announcement(node: &Node, content: &[u8]) -> Result<()> {
             if !is_news && now.duration_since(*prev) < MIN_ANNOUNCE_GAP { return Ok(()); } // coalesce
         }
         last.insert(key, (now, marker));
+        sweep_last_accepted(&mut last, now);
     }
 
     match verified {
@@ -780,6 +790,23 @@ async fn process_announcement(node: &Node, content: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// Drop stale flood-guard entries and enforce the hard cap. The len gate
+// keeps the common case (a handful of known origins) a no-op; one insert
+// exceeds the cap by at most one, so the oldest-eviction loop runs at most
+// once per message.
+fn sweep_last_accepted(map: &mut HashMap<String, (Instant, u64)>, now: Instant) {
+    if map.len() > 64 {
+        map.retain(|_, (t, _)| now.duration_since(*t) < LAST_ACCEPTED_TTL);
+    }
+    while map.len() > LAST_ACCEPTED_CAP {
+        let oldest = map.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| k.clone());
+        match oldest {
+            Some(k) => { map.remove(&k); }
+            None => break,
+        }
+    }
 }
 
 // Field sanity: hashes are 64 hex chars; strings are capped and must not
@@ -1037,5 +1064,51 @@ mod tests {
         let sk = SecretKey::generate();
         let wire = signed_holds(&sk, vec!["ef".repeat(32)], true);
         assert!(verify_wire(&wire).is_err(), "padded hold set must not verify");
+    }
+
+    // Times are built by ADDING to a base instant — Instant subtraction can
+    // underflow on a freshly booted machine (CI), so "old" is the base and
+    // "now" sits a TTL past it.
+    #[test]
+    fn last_accepted_sweep_drops_stale_origins() {
+        let base = Instant::now();
+        let now = base + LAST_ACCEPTED_TTL + Duration::from_secs(60);
+        let mut map = HashMap::new();
+        for i in 0..70 {
+            map.insert(format!("announce:origin{i}"), (base, i as u64)); // all stale
+        }
+        map.insert("announce:fresh".to_string(), (now, 1));
+        sweep_last_accepted(&mut map, now);
+        assert_eq!(map.len(), 1, "stale origins must be dropped once past the len gate");
+        assert!(map.contains_key("announce:fresh"));
+    }
+
+    #[test]
+    fn last_accepted_sweep_is_a_noop_for_small_maps() {
+        // A handful of known origins — the steady state — must never be
+        // scanned or evicted, stale or not.
+        let base = Instant::now();
+        let now = base + LAST_ACCEPTED_TTL + Duration::from_secs(60);
+        let mut map = HashMap::new();
+        for i in 0..10 {
+            map.insert(format!("announce:origin{i}"), (base, i as u64)); // stale, but few
+        }
+        sweep_last_accepted(&mut map, now);
+        assert_eq!(map.len(), 10, "below the len gate the map is untouched");
+    }
+
+    #[test]
+    fn last_accepted_sweep_enforces_the_hard_cap() {
+        // An identity-minting flood inside one TTL window: every entry is
+        // fresh, so only the cap can bound the map — oldest goes first.
+        let base = Instant::now();
+        let mut map = HashMap::new();
+        map.insert("announce:oldest".to_string(), (base, 0));
+        for i in 0..LAST_ACCEPTED_CAP {
+            map.insert(format!("announce:mint{i}"), (base + Duration::from_secs(1), 0));
+        }
+        sweep_last_accepted(&mut map, base + Duration::from_secs(2));
+        assert_eq!(map.len(), LAST_ACCEPTED_CAP, "the cap must hold");
+        assert!(!map.contains_key("announce:oldest"), "the oldest entry is the one evicted");
     }
 }
