@@ -55,6 +55,12 @@ at least a MINOR bump here.
   never a crash, never silence.
 - New unsolicited events are additive; consumers ignore events they don't
   know.
+- New OPTIONAL request params are additive too: the request parser tolerates
+  unknown keys, so an older sidecar silently ignores a param it predates.
+  That means a param can never be the only line of defense — the server
+  keeps its own fallback until the pinned sidecar is new enough (e.g.
+  `fetch.maxBytes`, added in v1.0.4: pre-1.0.4 sidecars download uncapped
+  and the server's post-download size check does the rejecting).
 - A change that breaks existing commands, events, or the signed wire formats
   (announcements, holds beacons) requires at least a MINOR bump and a loud
   release note. The wire formats carry their own `v` field and reject
