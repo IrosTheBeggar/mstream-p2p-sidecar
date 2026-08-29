@@ -25,6 +25,10 @@
 // Optional `maxBytes` (v1.0.4+) aborts the transfer past a byte ceiling —
 // the hash proves WHAT the bytes are, never HOW MANY there will be, and the
 // catalog flow's size expectation comes from the peer's own announcement.
+// Optional `hold` (v1.0.4+) roots the fetched blob with a persistent tag so
+// this node keeps SEEDING it (the holds/swarm flow) — without it a fetched
+// blob has no GC root and the 15-min sweep silently deletes what the holds
+// beacon is still advertising. `forget` releases held blobs.
 //
 // N2 (gossip catalog): `join` subscribes to the well-known catalog topic
 // (bootstrap = endpoint tickets or bare ids); `announce` broadcasts a
@@ -52,7 +56,8 @@
 //   → {"id":2,"cmd":"publish","path":"C:/.../discovery-export.db"}
 //   → {"id":3,"cmd":"fetch","ticket":"blob...","outDir":"C:/.../discovery-peers"}
 //   → {"id":4,"cmd":"fetch","hash":"<64 hex>","provider":"<endpoint id>","outDir":"..."}
-//        ("providers":[...] for the swarm flow; optional "maxBytes" caps the transfer)
+//        ("providers":[...] for the swarm flow; optional "maxBytes" caps the
+//         transfer; optional "hold":true keeps seeding the blob afterwards)
 //   → {"id":5,"cmd":"join","bootstrap":["<endpoint ticket | endpoint id>",...]}
 //   → {"id":6,"cmd":"announce","payload":{"hash":"...","size":1,"rowCount":1,
 //        "modelId":"...","modelVersion":"...","snapshotSeq":1,"name":"...",
@@ -173,6 +178,16 @@ struct Request {
     // own post-download size check as the fallback.
     #[serde(rename = "maxBytes")]
     max_bytes: Option<u64>,
+    // Keep the fetched blob rooted in the store after the transfer (a
+    // persistent tag), so this node can go on SERVING it — the holds/swarm
+    // flow. Without it a fetched blob has no GC root at all and the next
+    // sweep (15-min interval) deletes it, leaving the holds beacon
+    // advertising bytes the store no longer has. Default false: a plain
+    // fetch (e.g. a one-off ticket pull) delivers the exported file and
+    // lets the store copy evaporate — nothing would ever forget it
+    // otherwise. `forget` releases held blobs by hash.
+    #[serde(default)]
+    hold: bool,
     bootstrap: Option<Vec<String>>,
     // Untyped here because two commands share it: `announce` parses it into
     // AnnouncePayload, `dm` forwards it opaquely (content is Node's concern).
@@ -494,6 +509,13 @@ async fn handle(node: Arc<Node>, req: Request) -> Result<Value> {
                     ids.push(EndpointId::from_str(p).map_err(|e| anyhow!("bad provider id '{p}': {e}"))?);
                 }
                 if ids.is_empty() { bail!("providers list is empty"); }
+                // Temp tag across the transfer: downloads create no GC root
+                // of their own, so without this a sweep racing a slow
+                // transfer could delete the partial bytes mid-write. Dropped
+                // on every exit path — an aborted/failed transfer's partial
+                // data goes back to being sweepable.
+                let _transfer_guard = node.store.tags().temp_tag(hash).await
+                    .map_err(|e| anyhow!("temp tag failed: {e}"))?;
                 let progress = node.store.downloader(&node.endpoint)
                     .download(hash, iroh_blobs::api::downloader::Shuffled::new(ids));
                 if let Some(max) = req.max_bytes {
@@ -541,6 +563,14 @@ async fn handle(node: Arc<Node>, req: Request) -> Result<Value> {
                     let _ = tokio::fs::remove_file(&out_path).await;
                     bail!("fetched blob is {size} bytes — over maxBytes");
                 }
+                if req.hold {
+                    // Persistent GC root so we keep seeding this blob (the
+                    // holds flow). Deterministic name = idempotent re-fetch;
+                    // `forget` deletes tags by hash value, so it reclaims
+                    // this along with any others.
+                    node.store.tags().set(format!("held-{hash}"), hash).await
+                        .map_err(|e| anyhow!("hold tag failed: {e}"))?;
+                }
                 return Ok(json!({
                     "hash": hash.to_string(),
                     "size": size,
@@ -559,6 +589,9 @@ async fn handle(node: Arc<Node>, req: Request) -> Result<Value> {
                 (hash, provider.into())
             };
 
+            // Same in-flight protection as the swarm branch above.
+            let _transfer_guard = node.store.tags().temp_tag(hash).await
+                .map_err(|e| anyhow!("temp tag failed: {e}"))?;
             let conn = node.endpoint.connect(addr, iroh_blobs::ALPN)
                 .await
                 .map_err(|e| anyhow!("cannot reach the blob's origin: {e}"))?;
@@ -598,6 +631,11 @@ async fn handle(node: Arc<Node>, req: Request) -> Result<Value> {
             if req.max_bytes.is_some_and(|max| size > max) {
                 let _ = tokio::fs::remove_file(&out_path).await;
                 bail!("fetched blob is {size} bytes — over maxBytes");
+            }
+            if req.hold {
+                // Persistent GC root — see the swarm branch.
+                node.store.tags().set(format!("held-{hash}"), hash).await
+                    .map_err(|e| anyhow!("hold tag failed: {e}"))?;
             }
             Ok(json!({
                 "hash": hash.to_string(),
