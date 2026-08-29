@@ -22,6 +22,9 @@
 // N1 (blobs): `publish` seeds a file (the discovery export snapshot) as a
 // content-addressed blob and returns a ticket; `fetch` pulls a blob —
 // BLAKE3-verified — into a local file, from a ticket or from {hash, provider}.
+// Optional `maxBytes` (v1.0.4+) aborts the transfer past a byte ceiling —
+// the hash proves WHAT the bytes are, never HOW MANY there will be, and the
+// catalog flow's size expectation comes from the peer's own announcement.
 //
 // N2 (gossip catalog): `join` subscribes to the well-known catalog topic
 // (bootstrap = endpoint tickets or bare ids); `announce` broadcasts a
@@ -49,6 +52,7 @@
 //   → {"id":2,"cmd":"publish","path":"C:/.../discovery-export.db"}
 //   → {"id":3,"cmd":"fetch","ticket":"blob...","outDir":"C:/.../discovery-peers"}
 //   → {"id":4,"cmd":"fetch","hash":"<64 hex>","provider":"<endpoint id>","outDir":"..."}
+//        ("providers":[...] for the swarm flow; optional "maxBytes" caps the transfer)
 //   → {"id":5,"cmd":"join","bootstrap":["<endpoint ticket | endpoint id>",...]}
 //   → {"id":6,"cmd":"announce","payload":{"hash":"...","size":1,"rowCount":1,
 //        "modelId":"...","modelVersion":"...","snapshotSeq":1,"name":"...",
@@ -79,6 +83,8 @@ use iroh::{
     EndpointId, PublicKey, SecretKey, Signature,
 };
 use iroh_blobs::{
+    api::downloader::DownloadProgressItem,
+    api::remote::GetProgressItem,
     store::fs::{options::Options as StoreOptions, FsStore},
     store::GcConfig,
     ticket::BlobTicket, BlobsProtocol, Hash,
@@ -93,6 +99,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, Mutex};
+use tokio_stream::StreamExt;
 
 // The well-known catalog topic. Deriving it from a versioned string means a
 // future incompatible announcement format simply moves to .../v2 — old and
@@ -154,6 +161,18 @@ struct Request {
     providers: Option<Vec<String>>,
     #[serde(rename = "outDir")]
     out_dir: Option<String>,
+    // Fetch byte ceiling. A catalog announcement's `size` is an unsigned
+    // CLAIM — the blob behind the hash can be arbitrarily larger, and
+    // without a cap a malicious announcer turns every auto-fetch into an
+    // unbounded write into this store (disk-fill DoS). The parent passes
+    // the tightest bound it knows (announced size, else its storage-cap
+    // headroom); the transfer aborts as soon as the byte count passes it.
+    // Absent = legacy uncapped behaviour (ticket fetches from a trusted
+    // friend). Pre-1.0.4 sidecars ignore the field — same wire shape,
+    // serde tolerates unknown request keys — so the parent must keep its
+    // own post-download size check as the fallback.
+    #[serde(rename = "maxBytes")]
+    max_bytes: Option<u64>,
     bootstrap: Option<Vec<String>>,
     // Untyped here because two commands share it: `announce` parses it into
     // AnnouncePayload, `dm` forwards it opaquely (content is Node's concern).
@@ -475,11 +494,36 @@ async fn handle(node: Arc<Node>, req: Request) -> Result<Value> {
                     ids.push(EndpointId::from_str(p).map_err(|e| anyhow!("bad provider id '{p}': {e}"))?);
                 }
                 if ids.is_empty() { bail!("providers list is empty"); }
-                node.store.downloader(&node.endpoint)
-                    .download(hash, iroh_blobs::api::downloader::Shuffled::new(ids))
-                    .await
-                    .map_err(|e| anyhow!("swarm transfer failed (no reachable provider): {e}"))?;
-                    // Short filename on purpose: the full 64-hex hash + ".db" burned
+                let progress = node.store.downloader(&node.endpoint)
+                    .download(hash, iroh_blobs::api::downloader::Shuffled::new(ids));
+                if let Some(max) = req.max_bytes {
+                    // Byte ceiling: walk the progress stream instead of
+                    // awaiting completion, and abort — dropping the stream
+                    // cancels the transfer — the moment the aggregated
+                    // payload count passes the cap. Stream end without an
+                    // error item is the success signal (same contract as the
+                    // downloader's own complete()).
+                    let mut stream = progress.stream().await
+                        .map_err(|e| anyhow!("swarm transfer failed (no reachable provider): {e}"))?;
+                    while let Some(item) = stream.next().await {
+                        match item {
+                            DownloadProgressItem::Progress(n) if n > max => {
+                                bail!("transfer exceeded maxBytes ({n} > {max}) — aborted");
+                            }
+                            DownloadProgressItem::Error(e) => {
+                                return Err(anyhow!("swarm transfer failed (no reachable provider): {e}"));
+                            }
+                            DownloadProgressItem::DownloadError => {
+                                bail!("swarm transfer failed (no reachable provider)");
+                            }
+                            _ => {}
+                        }
+                    }
+                } else {
+                    progress.await
+                        .map_err(|e| anyhow!("swarm transfer failed (no reachable provider): {e}"))?;
+                }
+                // Short filename on purpose: the full 64-hex hash + ".db" burned
                 // 67 chars of Windows' 260-char MAX_PATH budget, so a deep
                 // dbDirectory produced a file Node/SQLite could not open (Rust
                 // writes long paths fine via \\?\ — that asymmetry is the trap).
@@ -489,6 +533,14 @@ async fn handle(node: Arc<Node>, req: Request) -> Result<Value> {
                 node.store.blobs().export(hash, out_path.clone()).await
                     .map_err(|e| anyhow!("export to file failed: {e}"))?;
                 let size = tokio::fs::metadata(&out_path).await?.len();
+                // Belt over the streaming cap: a blob completed across several
+                // capped-and-aborted attempts (resume skips already-held
+                // ranges, so each attempt's counter starts over) can exceed
+                // the cap in total. The exported file's true size settles it.
+                if req.max_bytes.is_some_and(|max| size > max) {
+                    let _ = tokio::fs::remove_file(&out_path).await;
+                    bail!("fetched blob is {size} bytes — over maxBytes");
+                }
                 return Ok(json!({
                     "hash": hash.to_string(),
                     "size": size,
@@ -510,8 +562,31 @@ async fn handle(node: Arc<Node>, req: Request) -> Result<Value> {
             let conn = node.endpoint.connect(addr, iroh_blobs::ALPN)
                 .await
                 .map_err(|e| anyhow!("cannot reach the blob's origin: {e}"))?;
-            node.store.remote().fetch(conn, hash).await
-                .map_err(|e| anyhow!("transfer failed: {e}"))?;
+            let progress = node.store.remote().fetch(conn, hash);
+            if let Some(max) = req.max_bytes {
+                // Byte ceiling — the single-origin twin of the swarm branch
+                // above. GetProgress has explicit terminal items, so success
+                // is Done, not stream end.
+                let stream = progress.stream();
+                tokio::pin!(stream);
+                let mut outcome: Option<Result<()>> = None;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        GetProgressItem::Progress(n) if n > max => {
+                            bail!("transfer exceeded maxBytes ({n} > {max}) — aborted");
+                        }
+                        GetProgressItem::Progress(_) => {}
+                        GetProgressItem::Done(_) => { outcome = Some(Ok(())); }
+                        GetProgressItem::Error(e) => {
+                            outcome = Some(Err(anyhow!("transfer failed: {e}")));
+                        }
+                    }
+                }
+                outcome.unwrap_or_else(
+                    || Err(anyhow!("transfer failed: stream ended without a result")))?;
+            } else {
+                progress.await.map_err(|e| anyhow!("transfer failed: {e}"))?;
+            }
 
             // Short filename on purpose — see the swarm branch above for the
             // Windows MAX_PATH rationale.
@@ -519,6 +594,11 @@ async fn handle(node: Arc<Node>, req: Request) -> Result<Value> {
             node.store.blobs().export(hash, out_path.clone()).await
                 .map_err(|e| anyhow!("export to file failed: {e}"))?;
             let size = tokio::fs::metadata(&out_path).await?.len();
+            // Belt over the streaming cap — see the swarm branch.
+            if req.max_bytes.is_some_and(|max| size > max) {
+                let _ = tokio::fs::remove_file(&out_path).await;
+                bail!("fetched blob is {size} bytes — over maxBytes");
+            }
             Ok(json!({
                 "hash": hash.to_string(),
                 "size": size,
