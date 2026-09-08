@@ -61,7 +61,9 @@
 //   → {"id":5,"cmd":"join","bootstrap":["<endpoint ticket | endpoint id>",...]}
 //   → {"id":6,"cmd":"announce","payload":{"hash":"...","size":1,"rowCount":1,
 //        "modelId":"...","modelVersion":"...","snapshotSeq":1,"name":"...",
-//        "description":"..."}}   (description optional, ≤180 chars)
+//        "description":"...","acceptsRequests":true}}
+//        (description optional, ≤180 chars; acceptsRequests optional, v1.1.0+,
+//         omitted from the wire when false)
 //   → {"id":7,"cmd":"dm","to":"<endpoint ticket | endpoint id>","payload":{...}}
 //        ← {"id":7,"ok":true,"delivered":true}                    (accepted)
 //        ← {"id":7,"ok":true,"delivered":false,"reason":"..."}    (peer refused)
@@ -223,6 +225,23 @@ struct AnnouncePayload {
     // signature-compatible with pre-description builds.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     description: String,
+    // Whether the announcer's federation-requests inbox is open — the
+    // operator's "accept requests" switch, advertised so catalog users can
+    // tell who will even look at a pairing request before they send one.
+    // A HINT, not a promise: delivery is still gated at the DM transport
+    // and by the receiver's own verb-level check. Signed like the text
+    // fields (a relay must not be able to flip it either way), and omitted
+    // from the wire AND the signing string when false, so a closed-inbox
+    // announcement stays byte-identical to pre-v1.1.0 ones — old verifiers
+    // keep accepting those, while an open-inbox announcement is dropped by
+    // them (the same trade-off `description` shipped with).
+    #[serde(rename = "acceptsRequests", default, skip_serializing_if = "is_false")]
+    accepts_requests: bool,
+}
+
+// serde `skip_serializing_if` helper: a false flag is left off the wire.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 // Holds beacon wire form (kind:"holds"). Signed like announcements — the
@@ -1157,19 +1176,33 @@ fn validate_payload(mut p: AnnouncePayload) -> Result<AnnouncePayload> {
 
 // Deterministic signing input. Pipe-separated is safe because '|' is
 // rejected in every free-text field above and the rest are hex/integers.
-// The description segment is appended ONLY when non-empty: pre-description
-// builds compute the string without it, so servers that leave the field
-// blank stay verifiable by old peers in both directions. (A described
-// announcement is dropped by old verifiers — acceptable while the network
-// is young; a wholesale format break would move CATALOG_TOPIC to /v2.)
+//
+// Optional segments (description, then the acceptsRequests flag) are
+// appended ONLY when used, so an announcement that uses none of them
+// signs exactly the bytes pre-extension builds compute — servers that
+// leave them at their defaults stay verifiable by old peers in both
+// directions. An announcement that DOES use one is dropped by older
+// verifiers — acceptable while the network is young; a wholesale format
+// break would move CATALOG_TOPIC to /v2.
+//
+// The optional segments come in a FIXED order, and every earlier optional
+// segment is emitted (possibly empty) whenever a later one is. That rule
+// is what keeps the string unambiguous: without it {description:"",
+// acceptsRequests:true} and {description:"1"} would sign identical bytes,
+// and a relay could rewrite one announcement into the other under a valid
+// signature. Pipes are rejected in free text, so fixed positions cannot
+// collide.
 fn canonical_bytes(from: &str, p: &AnnouncePayload) -> Vec<u8> {
     let mut s = format!(
         "{SIGNING_CONTEXT}|{from}|{}|{}|{}|{}|{}|{}|{}",
         p.hash, p.size, p.row_count, p.model_id, p.model_version, p.snapshot_seq, p.name
     );
-    if !p.description.is_empty() {
+    if !p.description.is_empty() || p.accepts_requests {
         s.push('|');
         s.push_str(&p.description);
+    }
+    if p.accepts_requests {
+        s.push_str("|1");
     }
     s.into_bytes()
 }
@@ -1228,6 +1261,7 @@ mod tests {
             snapshot_seq: 7,
             name: "Unit Test".into(),
             description: String::new(),
+            accepts_requests: false,
         }
     }
 
@@ -1364,6 +1398,71 @@ mod tests {
         assert!(verify_wire(&wire).is_err(), "pipe in description must be rejected");
         let wire = signed_announcement_with(&sk, None, |p| { p.description = "line\nbreak".into(); }, |_| {});
         assert!(verify_wire(&wire).is_err(), "control chars in description must be rejected");
+    }
+
+    #[test]
+    fn accepting_announcement_verifies_and_round_trips() {
+        let sk = SecretKey::generate();
+        let wire = signed_announcement_with(&sk, None, |p| { p.accepts_requests = true; }, |_| {});
+        assert!(String::from_utf8(wire.clone()).unwrap().contains(r#""acceptsRequests":true"#),
+            "an open inbox must be on the wire under its camelCase name");
+        match verify_wire(&wire).expect("must verify") {
+            Verified::Announce { payload, .. } => assert!(payload.accepts_requests),
+            other => panic!("wrong kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tampered_accepts_flag_is_rejected() {
+        // Both directions are forgeries a relay must not get away with:
+        // hiding an open inbox, or advertising a closed one as open (wasted
+        // dials and typed refusals for everyone who trusts the chip).
+        let sk = SecretKey::generate();
+        let wire = signed_announcement_with(&sk, None,
+            |p| { p.accepts_requests = true; },
+            |p| { p.accepts_requests = false; });
+        assert!(verify_wire(&wire).is_err(), "stripped flag must not verify");
+        let wire = signed_announcement(&sk, None, |p| { p.accepts_requests = true; });
+        assert!(verify_wire(&wire).is_err(), "injected flag must not verify");
+    }
+
+    #[test]
+    fn closed_inbox_wire_is_byte_identical_to_legacy() {
+        // The compatibility promise: a false flag leaves both the JSON and
+        // the signing string exactly as pre-v1.1.0 builds produce them, so
+        // old verifiers keep accepting closed-inbox announcements.
+        let sk = SecretKey::generate();
+        let wire = signed_announcement(&sk, None, |_| {});
+        assert!(!String::from_utf8(wire.clone()).unwrap().contains("acceptsRequests"),
+            "a false flag must be omitted from the wire");
+        let legacy = format!("{SIGNING_CONTEXT}|x|{}|1024|10|test-model|1|7|Unit Test", "ab".repeat(32));
+        assert_eq!(canonical_bytes("x", &test_payload()), legacy.into_bytes());
+        assert!(verify_wire(&wire).is_ok());
+    }
+
+    #[test]
+    fn flag_segment_cannot_masquerade_as_a_description() {
+        // {description:"", acceptsRequests:true} vs {description:"1"} — the
+        // trap the fixed-order rule in canonical_bytes exists for. Same
+        // signer, same base fields: the signing bytes MUST differ, or a
+        // relay could rewrite one announcement into the other.
+        let mut open = test_payload();
+        open.accepts_requests = true;
+        let mut described = test_payload();
+        described.description = "1".into();
+        assert_ne!(canonical_bytes("x", &open), canonical_bytes("x", &described));
+        let mut both = test_payload();
+        both.description = "1".into();
+        both.accepts_requests = true;
+        assert_ne!(canonical_bytes("x", &both), canonical_bytes("x", &open));
+        assert_ne!(canonical_bytes("x", &both), canonical_bytes("x", &described));
+        // The wire-level consequence: a signed open-inbox announcement
+        // re-labelled as a described one does not verify.
+        let sk = SecretKey::generate();
+        let wire = signed_announcement_with(&sk, None,
+            |p| { p.accepts_requests = true; },
+            |p| { p.accepts_requests = false; p.description = "1".into(); });
+        assert!(verify_wire(&wire).is_err());
     }
 
     #[test]

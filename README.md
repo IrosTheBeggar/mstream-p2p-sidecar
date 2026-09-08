@@ -41,10 +41,13 @@ history; everything before the extraction lives in
 
 ## Versioning policy
 
-`MAJOR.MINOR` mirrors the pinned iroh line; `PATCH` is this sidecar's own.
-So `v1.0.x` releases pin iroh `1.0.*` (see `Cargo.toml` — the iroh crates
-are pinned exactly and bumped together, deliberately). A new iroh line means
-at least a MINOR bump here.
+`MAJOR.MINOR` is the protocol line; `PATCH` is this sidecar's own. A MINOR
+bump means one of two things: a new pinned iroh line (the `v1.0.x` releases
+pin iroh `1.0.*` — see `Cargo.toml`, the iroh crates are pinned exactly and
+bumped together, deliberately), or an extension of the signed wire formats
+(`v1.1.0` added the `acceptsRequests` announcement field while staying on
+iroh `1.0.*`). PATCH releases add optional RPC params, fix bugs, and bump
+dependencies within a line.
 
 ## Compatibility contract (server ↔ sidecar)
 
@@ -61,6 +64,17 @@ at least a MINOR bump here.
   keeps its own fallback until the pinned sidecar is new enough (e.g.
   `fetch.maxBytes`, added in v1.0.4: pre-1.0.4 sidecars download uncapped
   and the server's post-download size check does the rejecting).
+- Optional ANNOUNCEMENT fields are additive only under one rule: the field
+  is left off the wire AND out of the signing string whenever it holds its
+  default (`description` when empty, `acceptsRequests` — v1.1.0 — when
+  false). A default-valued announcement is then byte-identical to what older
+  builds produce, so older verifiers keep accepting it; an announcement that
+  USES the field fails signature verification on older sidecars and is
+  dropped there — that server is invisible to un-upgraded peers' catalogs
+  until they upgrade. Gossip still relays the bytes, so a mixed mesh keeps
+  working. Optional segments join the signing string in a fixed order, and
+  every earlier optional segment is present (possibly empty) whenever a
+  later one is — `canonical_bytes` in `src/main.rs` says why.
 - A change that breaks existing commands, events, or the signed wire formats
   (announcements, holds beacons) requires at least a MINOR bump and a loud
   release note. The wire formats carry their own `v` field and reject
