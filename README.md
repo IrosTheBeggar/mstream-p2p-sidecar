@@ -42,9 +42,39 @@ history; everything before the extraction lives in
 ## Versioning policy
 
 `MAJOR.MINOR` mirrors the pinned iroh line; `PATCH` is this sidecar's own.
-So `v1.0.x` releases pin iroh `1.0.*` (see `Cargo.toml` — the iroh crates
-are pinned exactly and bumped together, deliberately). A new iroh line means
-at least a MINOR bump here.
+So `v1.0.x` releases pin iroh `1.0.*` and `v1.4.x` releases pin iroh
+`1.4.*` (see `Cargo.toml` — the iroh crates are pinned exactly and bumped
+together, deliberately). A new iroh line means at least a MINOR bump here.
+
+`iroh-gossip` is the exception to "crates.io, pinned exactly": since v1.4.0
+it comes from a tag on the `IrosTheBeggar/iroh-gossip` fork that is upstream
+`main` plus upstream PR #185, because the 0.101.0 release wedges the whole
+network under a slow peer (the 2026-10-22 outage — the comment in
+`Cargo.toml` has the full story). The tag is pinned like a version: never
+track a branch. Re-pin to crates.io the moment a release contains #185.
+
+## Liveness (v1.4.0+)
+
+The gossip actor is a single task. If it stops turning, every topic on the
+node goes silent while the QUIC links — and so the neighbor lists on both
+sides — stay up, which is exactly what the 2026-10-22 outage looked like:
+`status` kept reporting the last neighbor count for 22 hours and nothing
+noticed. Three guards now:
+
+- `status` reports the **live** neighbor set (`neighbors`, from events)
+  plus `lastGossipAgeSecs` / `lastEventAgeSecs` (seconds since the last
+  received message / any gossip event, `null` before the first),
+  `subscriberRestarts` and `actorAlive`. A server can treat "joined,
+  neighbors > 0, lastGossipAgeSecs in the tens of minutes" as a dead mesh.
+- A dead subscriber is re-created. The gossip API *closes* a lagged
+  subscriber; the old loop logged "lagged" and died with it. On
+  re-subscribe the sidecar emits `{"event":"neighbors","reset":true}` and
+  the actor replays a `neighbor` up event per current neighbor.
+- An actor probe: while there are neighbors, a fresh subscribe must yield
+  the actor's NeighborUp replay within 20 s. Two misses in a row and the
+  process exits with **code 3** so the parent respawns it (mStream's crash
+  recovery replays the whole stack; a seed's container restart policy does
+  the same). Exit code 0 stays "clean" (stdin EOF / `shutdown`).
 
 ## Compatibility contract (server ↔ sidecar)
 
