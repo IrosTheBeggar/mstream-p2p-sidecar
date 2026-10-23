@@ -51,8 +51,27 @@
 // gets an immediate typed refusal instead of silence. Rust caps sizes and
 // rate-limits; payload CONTENT is Node's problem.
 //
+// LIVENESS (v1.4.0+): the gossip actor is one task; when it stops turning
+// (the 2026-10-22 network-wide wedge — a neighbor that stopped reading
+// filled its send queue and the actor blocked on it; fixed in the pinned
+// iroh-gossip, see Cargo.toml) every topic goes silent while the QUIC
+// links, and so both sides' neighbor lists, stay up. Three guards: (1)
+// `status` reports the LIVE neighbor set plus the age of the last gossip
+// event, instead of a counter that froze with the actor; (2) a dead
+// subscriber is re-created — the gossip API CLOSES a lagged subscriber,
+// and the old loop just logged "lagged" and died with it; (3) an actor
+// probe exits the process with code 3 when a fresh subscriber gets no
+// NeighborUp replay twice in a row, so the parent's crash recovery
+// (discovery-p2p-stack.js) replays the stack — a seed's restart policy
+// does the same.
+//
 // Protocol (one JSON object per line):
 //   → {"id":1,"cmd":"status"}
+//        ← {"id":1,"ok":true,"endpointId":"...","hasRelay":bool,"ticket":"...",
+//            "joined":bool,"neighbors":N,          (N = live gossip links)
+//            "lastGossipAgeSecs":N|null,            (v1.4.0+: since the last received message)
+//            "lastEventAgeSecs":N|null,             (v1.4.0+: since any gossip event)
+//            "subscriberRestarts":N,"actorAlive":bool}   (v1.4.0+)
 //   → {"id":2,"cmd":"publish","path":"C:/.../discovery-export.db"}
 //   → {"id":3,"cmd":"fetch","ticket":"blob...","outDir":"C:/.../discovery-peers"}
 //   → {"id":4,"cmd":"fetch","hash":"<64 hex>","provider":"<endpoint id>","outDir":"..."}
@@ -73,12 +92,16 @@
 //   ← {"event":"ready","endpointId":"...","ticket":"..."}
 //   ← {"event":"announcement","from":"...","payload":{...}}
 //   ← {"event":"neighbor","up":true|false,"id":"..."}
+//   ← {"event":"neighbors","reset":true}   (v1.4.0+: the subscriber was re-created;
+//        the parent clears its neighbor set, the replayed "neighbor" ups follow)
 //   ← {"event":"dm","from":"<endpoint id>","payload":{...}}
+// Exit codes: 0 = clean (stdin EOF / shutdown); 3 = the gossip layer is dead
+// (actor probe or re-subscribe gave up) and the parent should respawn.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -138,6 +161,20 @@ const MAX_HOLDS_BYTES: usize = 8192;
 // origin regardless of what slips through here.
 const LAST_ACCEPTED_TTL: Duration = Duration::from_secs(30 * 60);
 const LAST_ACCEPTED_CAP: usize = 4096;
+
+// Gossip liveness (see LIVENESS in the header). The actor probe runs while
+// we have neighbors: a fresh subscribe must yield the actor's NeighborUp
+// replay within ACTOR_PROBE_TIMEOUT; ACTOR_PROBE_MAX_MISSES misses in a row
+// = the actor is wedged = exit(EXIT_GOSSIP_DEAD). With no neighbors there
+// is nothing to replay and nothing to judge — the parent's health watch
+// owns that case (it re-joins on neighbors == 0). Broadcasts get a timeout
+// so a wedged actor parks no loop forever (the probe decides what to do).
+const ACTOR_PROBE_INTERVAL: Duration = Duration::from_secs(60);
+const ACTOR_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+const ACTOR_PROBE_MAX_MISSES: u32 = 2;
+const RESUBSCRIBE_MAX_ATTEMPTS: u32 = 10;
+const BROADCAST_TIMEOUT: Duration = Duration::from_secs(30);
+const EXIT_GOSSIP_DEAD: i32 = 3;
 
 // Direct messages. The ALPN is versioned like the catalog topic: a future
 // incompatible envelope moves to /2 and old nodes fail the dial cleanly
@@ -274,8 +311,19 @@ struct Node {
     // sorted — beaconed periodically by the holds loop.
     current_holds: Mutex<Vec<String>>,
     heartbeat: std::sync::atomic::AtomicU64,
-    // Live direct neighbors on the catalog topic (from NeighborUp/Down).
-    neighbor_count: AtomicI64,
+    // Live direct neighbors on the catalog topic, tracked from the
+    // subscriber's NeighborUp/Down events and rebuilt from the actor's
+    // replay whenever the subscriber is re-created (see receive_loop).
+    neighbors: Mutex<HashSet<EndpointId>>,
+    // Liveness bookkeeping for `status` and the actor probe. std Mutexes:
+    // never held across an await, and panic=abort makes poisoning moot.
+    last_gossip_at: std::sync::Mutex<Option<Instant>>,
+    last_event_at: std::sync::Mutex<Option<Instant>>,
+    subscriber_restarts: AtomicU64,
+    actor_alive: AtomicBool,
+    // Set when the request loop ends: the gossip stream closing is then
+    // the shutdown itself, not a dead subscriber to re-create.
+    shutting_down: AtomicBool,
     // "kind:origin" -> (last accepted instant, seq/marker). Flood guard:
     // same-content heartbeats coalesce, genuinely-new content passes.
     last_accepted: Mutex<HashMap<String, (Instant, u64)>>,
@@ -395,7 +443,12 @@ async fn run(data_dir: PathBuf) -> Result<()> {
         current_announcement: Mutex::new(None),
         current_holds: Mutex::new(Vec::new()),
         heartbeat: std::sync::atomic::AtomicU64::new(0),
-        neighbor_count: AtomicI64::new(0),
+        neighbors: Mutex::new(HashSet::new()),
+        last_gossip_at: std::sync::Mutex::new(None),
+        last_event_at: std::sync::Mutex::new(None),
+        subscriber_restarts: AtomicU64::new(0),
+        actor_alive: AtomicBool::new(true),
+        shutting_down: AtomicBool::new(false),
         last_accepted: Mutex::new(HashMap::new()),
         dm,
         out_tx: out_tx.clone(),
@@ -447,6 +500,7 @@ async fn run(data_dir: PathBuf) -> Result<()> {
     // closing stdin anyway (discovery-p2p.js stop()), so everything here
     // must finish well inside that.
     eprintln!("[p2p-sidecar] shutting down");
+    node.shutting_down.store(true, Ordering::Relaxed);
     let _ = tokio::time::timeout(Duration::from_secs(3), async {
         let _ = node.router.shutdown().await;
         node.endpoint.close().await;
@@ -468,7 +522,11 @@ async fn handle(node: Arc<Node>, req: Request) -> Result<Value> {
                 "hasRelay": addr.relay_urls().next().is_some(),
                 "ticket": endpoint_ticket(&node),
                 "joined": node.topic_sender.lock().await.is_some(),
-                "neighbors": node.neighbor_count.load(Ordering::Relaxed).max(0),
+                "neighbors": node.neighbors.lock().await.len(),
+                "lastGossipAgeSecs": age_secs(&node.last_gossip_at),
+                "lastEventAgeSecs": age_secs(&node.last_event_at),
+                "subscriberRestarts": node.subscriber_restarts.load(Ordering::Relaxed),
+                "actorAlive": node.actor_alive.load(Ordering::Relaxed),
             }))
         }
 
@@ -677,9 +735,10 @@ async fn handle(node: Arc<Node>, req: Request) -> Result<Value> {
                     .map_err(|e| anyhow!("gossip subscribe failed: {e}"))?;
                 let (sender, receiver) = topic_handle.split();
                 *sender_slot = Some(sender.clone());
-                tokio::spawn(receive_loop(node.clone(), receiver));
+                tokio::spawn(receive_loop(node.clone(), topic, receiver));
                 tokio::spawn(announce_loop(node.clone(), sender.clone()));
                 tokio::spawn(holds_loop(node.clone(), sender));
+                tokio::spawn(actor_probe_loop(node.clone(), topic));
             }
             Ok(json!({ "joined": true, "bootstrapPeers": ids.len() }))
         }
@@ -948,11 +1007,7 @@ async fn holds_loop(node: Arc<Node>, sender: GossipSender) {
         tokio::time::sleep(HOLDS_INTERVAL).await;
         if node.current_holds.lock().await.is_empty() { continue; }
         match holds_wire(&node).await {
-            Ok(wire) => {
-                if let Err(e) = sender.broadcast(wire.into()).await {
-                    eprintln!("[p2p-sidecar] periodic holds beacon failed: {e}");
-                }
-            }
+            Ok(wire) => broadcast_logged(&sender, wire, "periodic holds beacon").await,
             Err(e) => eprintln!("[p2p-sidecar] holds serialization failed: {e}"),
         }
     }
@@ -978,42 +1033,147 @@ async fn announce_loop(node: Arc<Node>, sender: GossipSender) {
         let ann = node.current_announcement.lock().await.clone();
         if let Some(ann) = ann {
             match announcement_wire(&node, &ann) {
-                Ok(wire) => {
-                    if let Err(e) = sender.broadcast(wire.into()).await {
-                        eprintln!("[p2p-sidecar] periodic announce failed: {e}");
-                    }
-                }
+                Ok(wire) => broadcast_logged(&sender, wire, "periodic announce").await,
                 Err(e) => eprintln!("[p2p-sidecar] periodic announce serialization failed: {e}"),
             }
         }
     }
 }
 
-// Verify + rate-limit incoming gossip, forward good announcements to Node.
-async fn receive_loop(node: Arc<Node>, mut receiver: GossipReceiver) {
-    use tokio_stream::StreamExt;
+// A broadcast that can't hang its loop: the sender's command channel is
+// bounded, so a wedged actor would otherwise park the task forever and hide
+// the wedge behind a silent loop. Logged, not fatal — the actor probe is
+// the one that decides the actor is gone.
+async fn broadcast_logged(sender: &GossipSender, wire: Vec<u8>, what: &str) {
+    match tokio::time::timeout(BROADCAST_TIMEOUT, sender.broadcast(wire.into())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("[p2p-sidecar] {what} failed: {e}"),
+        Err(_) => eprintln!(
+            "[p2p-sidecar] {what} timed out after {}s — the gossip actor is not accepting commands",
+            BROADCAST_TIMEOUT.as_secs()
+        ),
+    }
+}
+
+// Seconds since an Instant, or null when it never happened — the shape the
+// status route hands to the parent's "last heard" display.
+fn age_secs(slot: &std::sync::Mutex<Option<Instant>>) -> Value {
+    match *slot.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some(at) => json!(at.elapsed().as_secs()),
+        None => Value::Null,
+    }
+}
+
+fn mark_now(slot: &std::sync::Mutex<Option<Instant>>) {
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+}
+
+// The actor probe (see the liveness constants): a fresh subscriber on a
+// topic with neighbors gets the actor's NeighborUp replay as its first
+// events, so a probe that sees no event in time proves the actor isn't
+// turning. The probe subscriber is dropped right after — the topic stays
+// joined through the sender clones the announce/holds loops hold.
+async fn actor_probe_loop(node: Arc<Node>, topic: TopicId) {
+    let mut misses = 0u32;
+    loop {
+        tokio::time::sleep(ACTOR_PROBE_INTERVAL).await;
+        if node.shutting_down.load(Ordering::Relaxed) { return; }
+        if node.neighbors.lock().await.is_empty() {
+            misses = 0;
+            continue;
+        }
+        let probe = async {
+            let handle = node.gossip.subscribe(topic, Vec::new()).await?;
+            let (_sender, mut rx) = handle.split();
+            rx.next().await.transpose()
+        };
+        let alive = matches!(tokio::time::timeout(ACTOR_PROBE_TIMEOUT, probe).await, Ok(Ok(Some(_))));
+        node.actor_alive.store(alive, Ordering::Relaxed);
+        if alive {
+            misses = 0;
+            continue;
+        }
+        misses += 1;
+        eprintln!(
+            "[p2p-sidecar] gossip actor probe failed ({misses}/{ACTOR_PROBE_MAX_MISSES}): \
+             no event within {}s on a fresh subscriber",
+            ACTOR_PROBE_TIMEOUT.as_secs()
+        );
+        if misses >= ACTOR_PROBE_MAX_MISSES {
+            eprintln!(
+                "[p2p-sidecar] FATAL: the gossip actor is wedged — exiting with code \
+                 {EXIT_GOSSIP_DEAD} so the parent replays the stack"
+            );
+            std::process::exit(EXIT_GOSSIP_DEAD);
+        }
+    }
+}
+
+// Verify + rate-limit incoming gossip, forward good announcements to Node —
+// and outlive the subscriber. The gossip API closes a lagged subscriber
+// (api.rs JoinOptions docs) and never revives a closed stream, while the
+// topic itself stays joined through the GossipSender clones the
+// announce/holds loops hold. So when the stream dies this loop subscribes
+// again: the actor replays NeighborUp for every current neighbor into the
+// fresh receiver, which is also how the live neighbor set gets rebuilt.
+async fn receive_loop(node: Arc<Node>, topic: TopicId, mut receiver: GossipReceiver) {
+    loop {
+        let why = consume_events(&node, &mut receiver).await;
+        if node.shutting_down.load(Ordering::Relaxed) { return; }
+        node.subscriber_restarts.fetch_add(1, Ordering::Relaxed);
+        eprintln!("[p2p-sidecar] gossip subscriber ended ({why}) — re-subscribing");
+        node.neighbors.lock().await.clear();
+        let _ = node.out_tx.send(json!({"event":"neighbors","reset":true}));
+        let mut attempt = 0u32;
+        receiver = loop {
+            attempt += 1;
+            match tokio::time::timeout(ACTOR_PROBE_TIMEOUT, node.gossip.subscribe(topic, Vec::new())).await {
+                Ok(Ok(handle)) => break handle.split().1,
+                Ok(Err(e)) => eprintln!("[p2p-sidecar] re-subscribe failed (attempt {attempt}): {e}"),
+                Err(_) => eprintln!(
+                    "[p2p-sidecar] re-subscribe timed out (attempt {attempt}) — gossip actor unresponsive"
+                ),
+            }
+            if attempt >= RESUBSCRIBE_MAX_ATTEMPTS {
+                eprintln!(
+                    "[p2p-sidecar] FATAL: could not re-subscribe to the catalog topic after \
+                     {attempt} attempts — exiting with code {EXIT_GOSSIP_DEAD} so the parent replays the stack"
+                );
+                std::process::exit(EXIT_GOSSIP_DEAD);
+            }
+            tokio::time::sleep(Duration::from_secs(1 << attempt.min(5))).await;
+        };
+    }
+}
+
+// Drains one subscriber until its stream ends; returns why it ended.
+async fn consume_events(node: &Node, receiver: &mut GossipReceiver) -> String {
     while let Some(event) = receiver.next().await {
+        mark_now(&node.last_event_at);
         match event {
             Ok(Event::Received(msg)) => {
-                if let Err(reason) = process_announcement(&node, &msg.content).await {
+                mark_now(&node.last_gossip_at);
+                if let Err(reason) = process_announcement(node, &msg.content).await {
                     eprintln!("[p2p-sidecar] dropped announcement from {}: {reason}", msg.delivered_from);
                 }
             }
             Ok(Event::NeighborUp(id)) => {
-                node.neighbor_count.fetch_add(1, Ordering::Relaxed);
+                node.neighbors.lock().await.insert(id);
                 let _ = node.out_tx.send(json!({"event":"neighbor","up":true,"id":id.to_string()}));
             }
             Ok(Event::NeighborDown(id)) => {
-                node.neighbor_count.fetch_sub(1, Ordering::Relaxed);
+                node.neighbors.lock().await.remove(&id);
                 let _ = node.out_tx.send(json!({"event":"neighbor","up":false,"id":id.to_string()}));
             }
-            Ok(Event::Lagged) => eprintln!("[p2p-sidecar] gossip receiver lagged — some announcements were missed"),
-            Err(e) => {
-                eprintln!("[p2p-sidecar] gossip stream error: {e}");
-                break;
-            }
+            // The actor closes a lagged subscriber; don't wait for the close,
+            // the stream is dead either way and the caller re-subscribes.
+            Ok(Event::Lagged) => return "lagged — the actor closed the subscriber".into(),
+            // Event is #[non_exhaustive]: a newer crate may add variants.
+            Ok(other) => eprintln!("[p2p-sidecar] ignoring unknown gossip event: {other:?}"),
+            Err(e) => return format!("stream error: {e}"),
         }
     }
+    "stream closed".into()
 }
 
 // What a wire message proved itself to be. verify_wire() is PURE (no Node,
