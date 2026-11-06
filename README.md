@@ -46,12 +46,13 @@ So `v1.0.x` releases pin iroh `1.0.*` and `v1.4.x` releases pin iroh
 `1.4.*` (see `Cargo.toml` — the iroh crates are pinned exactly and bumped
 together, deliberately). A new iroh line means at least a MINOR bump here.
 
-`iroh-gossip` is the exception to "crates.io, pinned exactly": since v1.4.0
-it comes from a tag on the `IrosTheBeggar/iroh-gossip` fork that is upstream
-`main` plus upstream PR #185, because the 0.101.0 release wedges the whole
-network under a slow peer (the 2026-10-22 outage — the comment in
-`Cargo.toml` has the full story). The tag is pinned like a version: never
-track a branch. Re-pin to crates.io the moment a release contains #185.
+`iroh-gossip` is back on "crates.io, pinned exactly" since v1.4.1 (0.102.0
+is the first release that contains upstream PR #185). v1.4.0 was the
+exception: it took the crate from a tag on the `IrosTheBeggar/iroh-gossip`
+fork — upstream `main` plus PR #185 — because the 0.101.0 release wedges
+the whole network under a slow peer (the 2026-10-22 outage; the comment in
+`Cargo.toml` has the full story). Should a fork ever be needed again: pin a
+tag like a version, never track a branch.
 
 ## Liveness (v1.4.0+)
 

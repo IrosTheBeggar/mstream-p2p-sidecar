@@ -1,6 +1,6 @@
 [package]
 name = "p2p-sidecar"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2021"
 
 [[bin]]
@@ -12,30 +12,36 @@ path = "src/main.rs"
 # between releases, so bump them together, deliberately, and re-run the
 # integration tests when you do. History: 1.0.1 → 1.0.3 (2026-07 spike);
 # 1.0.3 → 1.4.1 + iroh-blobs 0.103.1 on 2026-10-23 (0.103.0 was yanked
-# upstream; "update all packages" pass with the gossip fix below).
+# upstream; "update all packages" pass with the gossip fix below);
+# iroh-blobs 0.103.1 → 0.104.1 + iroh-gossip back to crates.io (0.102.0)
+# on 2026-11-06 ("update all packages" pass; the iroh line is unchanged,
+# so a PATCH release).
 iroh = "=1.4.1"
-iroh-blobs = "=0.103.1"
-# iroh-gossip: NOT the crates.io 0.101.0 release. That release (and our old
-# leakfix fork of it) has a network-wide failure mode: the gossip actor
-# blocks on the per-peer send queue (`active_send_tx.send(msg).await`,
-# 64 slots, no write timeout) when a neighbor stops reading, which freezes
-# every topic on the node — and a frozen node stops reading too, so the
-# freeze spreads to its neighbors. On 2026-10-22 it took down the production
-# sidecar and BOTH community seeds (mStream memory:
-# discovery-mesh-wedge-incident-2026-10-22; upstream
-# n0-computer/iroh-gossip#47 and #185). The fork tag below is upstream
-# `main` at cf859543 (2026-10-22: #161 peer lifecycle, #178 idle-connection
-# close, #186 actor-stall fixes, #189/#195 mixed-version safety, #191/#192
-# rejoin) plus upstream PR #185 (the byte-bounded per-peer send queue: the
-# actor never waits on a peer, data that does not fit is dropped, a control
-# message that does not fit aborts the peer; approved but unmerged at pin
-# time) — i.e. PR #185's head commit d60b06ed, which already contains main,
-# re-tagged on our fork so a squash-merge upstream can't orphan the rev.
-# Wire ALPN (/iroh-gossip/1) and message formats are unchanged since
-# 0.101.0, so this interoperates with the deployed 0.101 fleet. Re-pin to
-# the next crates.io release once it contains #185; treat the tag like the
-# exact pins around it — never track a branch.
-iroh-gossip = { git = "https://github.com/IrosTheBeggar/iroh-gossip", tag = "v0.101.0-wedgefix.1" }
+iroh-blobs = "=0.104.1"
+# iroh-gossip: 0.102.0 is the first crates.io release that contains upstream
+# PR #185 (merged 2026-10-28 as dee7a261), so v1.4.1 is back on crates.io.
+# The history, because the next slow-peer bug will look the same: the
+# 0.101.0 release (and our old leakfix fork of it) has a network-wide
+# failure mode — the gossip actor blocks on the per-peer send queue
+# (`active_send_tx.send(msg).await`, 64 slots, no write timeout) when a
+# neighbor stops reading, which freezes every topic on the node, and a
+# frozen node stops reading too, so the freeze spreads. On 2026-10-22 it
+# took down the production sidecar and BOTH community seeds (mStream
+# memory: discovery-mesh-wedge-incident-2026-10-22; upstream
+# n0-computer/iroh-gossip#47 and #185). v1.4.0 therefore took the crate
+# from a tag on our fork, IrosTheBeggar/iroh-gossip@v0.101.0-wedgefix.1
+# (= PR #185's head d60b06ed: upstream main at cf859543 plus the
+# byte-bounded per-peer send queue — the actor never waits on a peer, data
+# that does not fit is dropped, a control message that does not fit aborts
+# the peer). 0.102.0 contains all of that plus what landed after the tag:
+# #196 active-view refill back-off, #206 keep a connection while streams
+# are open, #207 grafted-peer stability, #215 per-peer address cap, #217
+# retry a lost Join. Wire ALPN (/iroh-gossip/1), the proto message enums
+# and the postcard framing are byte-identical to the fork tag and to
+# 0.101.0 (diffed at re-pin time), so this interoperates with every
+# deployed sidecar. If a fork is ever needed again: pin a tag, never a
+# branch.
+iroh-gossip = "=0.102.0"
 iroh-tickets = "=1.0.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
